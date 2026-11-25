@@ -58,7 +58,7 @@ def run(argv, env=None):
             twc.main()
             code = 0
         except SystemExit as exc:
-            code = exc.code if isinstance(exc.code, int) else 0
+            code = exc.code if isinstance(exc.code, int) else 1
     return code, out.getvalue(), err.getvalue(), paths
 
 
@@ -110,14 +110,15 @@ class Tests(unittest.TestCase):
         self.assertIn("truncated", err)
 
     def test_null_pagination_is_not_a_crash(self):
+        # A null pagination block means completeness cannot be confirmed: refuse, don't guess.
         RESPONSES["/admin/organizations?page%5Bnumber%5D=1&page%5Bsize%5D=100"] = {
             "data": [{"attributes": {"name": "finance"}}],
             "meta": {"pagination": None},
         }
-        RESPONSES[org_path("finance")] = envelope([], 4)
-        code, out, _, _ = run([])
-        self.assertEqual(code, 0)
-        self.assertIn("TOTAL         4", out)
+        code, out, err, _ = run([])
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("completeness cannot be confirmed", err)
 
     def test_empty_orgs_argument_fails(self):
         code, _, err, _ = run(["--orgs", " , "])
@@ -129,6 +130,37 @@ class Tests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(out, "")
         self.assertIn("set TFE_HOST and TFE_TOKEN", err)
+
+    def test_date_form_retry_after_falls_back_to_backoff(self):
+        headers = {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}
+        exc = urllib.error.HTTPError("u", 429, "slow down", headers, None)
+        self.assertEqual(twc.retry_seconds(exc, 1), 2)
+        self.assertEqual(twc.retry_seconds(exc, 3), 8)
+        self.assertEqual(twc.retry_seconds(urllib.error.HTTPError("u", 429, "x", {"Retry-After": "7"}, None), 1), 7)
+
+    def test_non_json_success_on_org_listing_reports_cleanly(self):
+        RESPONSES["/admin/organizations?page%5Bnumber%5D=1&page%5Bsize%5D=100"] = json.JSONDecodeError("boom", "", 0)
+        code, _, err, _ = run([])
+        self.assertEqual(code, 1)
+        self.assertIn("cannot list organisations", err)
+
+    def test_org_listing_without_pagination_metadata_is_not_assumed_complete(self):
+        RESPONSES["/admin/organizations?page%5Bnumber%5D=1&page%5Bsize%5D=100"] = {
+            "data": [{"attributes": {"name": "finance"}}]
+        }
+        code, _, err, _ = run([])
+        self.assertEqual(code, 1)
+        self.assertIn("completeness cannot be confirmed", err)
+
+    def test_empty_token_file_is_reported_as_such(self):
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".tok", delete=False) as fh:
+            fh.write("   \n")
+            path = fh.name
+        code, _, err, _ = run(["--token-file", path])
+        self.assertEqual(code, 1)
+        self.assertIn("token file is empty", err)
 
     def test_host_with_scheme_and_trailing_slash_is_normalised(self):
         RESPONSES[org_path("finance")] = envelope([], 1)

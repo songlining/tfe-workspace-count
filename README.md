@@ -90,9 +90,15 @@ limited (`429`) and `5xx` responses are retried up to three times, honouring `Re
 
 ## Self-checks
 
-Nine stdlib-only tests cover the cases that would otherwise produce a wrong licence number:
-incomplete runs, a missing `total-count`, duplicate `--orgs`, a truncated organisation list and
-a null pagination block.
+Thirteen stdlib-only tests cover the cases that would otherwise produce a wrong licence number:
+incomplete runs, a missing `total-count`, duplicate or empty `--orgs`, a truncated organisation
+list, pagination metadata that cannot confirm completeness, a non-JSON or non-object response on
+the organisation listing, date-form `Retry-After`, an empty token file, and host normalisation.
+
+Two deliberate refusals are worth knowing: if any organisation fails to count, the run exits 2
+and the CSV total row says `INCOMPLETE`; and if the organisation list cannot be shown to be
+complete (no `meta.pagination.total-count`, or fewer records than it promised), the run exits 1
+without a total, because a low licence figure is worse than no figure.
 
 ```bash
 python3 -m unittest discover -s tests -v

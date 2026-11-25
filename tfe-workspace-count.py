@@ -92,24 +92,33 @@ def api(host, token, path, ctx, page=None, size=100):
 def paged(host, token, path, ctx):
     """Yield data items across all pages, and fail if fewer arrived than the API promised."""
     expected = None
+    declared = None
     received = 0
     for page in range(1, MAX_PAGES + 1):
         body = api(host, token, path, ctx, page=page)
+        if not isinstance(body, dict):
+            raise ValueError("response is not a JSON object")
         items = body.get("data") or []
         pagination = (body.get("meta") or {}).get("pagination") or {}
         if expected is None:
             expected = pagination.get("total-count")
+        if declared is None:
+            declared = pagination.get("total-pages")
         yield from items
         received += len(items)
         if not items or page >= (pagination.get("total-pages") or page):
             break
     if isinstance(expected, int) and received < expected:
         raise ListingTruncated(f"received {received} of {expected} records")
+    if expected is None and not isinstance(declared, int):
+        raise ListingTruncated("pagination metadata missing, completeness cannot be confirmed")
 
 
 def workspace_count(host, token, org, ctx):
     org_path = urllib.parse.quote(org, safe="")
     body = api(host, token, f"/organizations/{org_path}/workspaces", ctx, page=1, size=1)
+    if not isinstance(body, dict):
+        raise ValueError("response is not a JSON object")
     count = ((body.get("meta") or {}).get("pagination") or {}).get("total-count")
     if not isinstance(count, int):
         raise ValueError("response has no meta.pagination.total-count")
@@ -137,7 +146,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--host", default=os.environ.get("TFE_HOST", ""))
     p.add_argument("--token-file", default="", help="takes precedence over $TFE_TOKEN")
-    p.add_argument("--orgs", default="", help="comma-separated org names; skips the site-admin org listing")
+    p.add_argument("--orgs", default=None, help="comma-separated org names; skips the site-admin org listing")
     p.add_argument("--csv", default="", help="also write CSV to this path")
     p.add_argument(
         "--insecure",
@@ -154,7 +163,7 @@ def main():
 
     ctx = ssl._create_unverified_context() if args.insecure else None
 
-    if args.orgs:
+    if args.orgs is not None:
         orgs = sorted({o.strip() for o in args.orgs.split(",") if o.strip()})
         if not orgs:
             fail("--orgs contained no organisation names")
@@ -170,7 +179,7 @@ def main():
             raise
         except ListingTruncated as exc:
             fail(f"organisation list was truncated ({exc}); refusing to report a total.")
-        except (urllib.error.URLError, ValueError) as exc:
+        except (urllib.error.URLError, ValueError, AttributeError, TypeError) as exc:
             fail(f"cannot list organisations: {exc}")
 
     captured = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
