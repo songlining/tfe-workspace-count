@@ -26,25 +26,50 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from typing import NamedTuple
 
 MAX_PAGES = 500
 RETRIES = 3
 
 
+class Row(NamedTuple):
+    org: str
+    count: int | None = None
+    reason: str = ""
+
+
+class ListingTruncated(Exception):
+    pass
+
+
+def fail(message):
+    print(f"error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
 def normalise_host(host: str) -> str:
     host = host.strip()
+    lowered = host.lower()
     for scheme in ("https://", "http://"):
-        if host.startswith(scheme):
+        if lowered.startswith(scheme):
             host = host[len(scheme):]
     return host.rstrip("/")
 
 
-def api(host, token, path, ctx, page=None):
-    """GET one API path. Retries 429/5xx honouring Retry-After."""
+def retry_seconds(exc, attempt):
+    header = exc.headers.get("Retry-After") if exc.headers else None
+    try:
+        return int(header)
+    except (TypeError, ValueError):
+        return 2 ** attempt  # also covers date-form Retry-After
+
+
+def api(host, token, path, ctx, page=None, size=100):
+    """GET one API path. Retries 429/5xx, honouring a numeric Retry-After."""
     sep = "&" if "?" in path else "?"
     url = f"https://{host}/api/v2{path}"
     if page:
-        url += f"{sep}page%5Bnumber%5D={page}&page%5Bsize%5D=100"
+        url += f"{sep}page%5Bnumber%5D={page}&page%5Bsize%5D={size}"
     req = urllib.request.Request(
         url,
         headers={
@@ -61,26 +86,51 @@ def api(host, token, path, ctx, page=None):
                 raise
             if attempt == RETRIES - 1:
                 raise
-            time.sleep(int(exc.headers.get("Retry-After") or 2 ** attempt))
+            time.sleep(retry_seconds(exc, attempt))
 
 
 def paged(host, token, path, ctx):
-    """Yield data items across all pages of a JSON:API list endpoint."""
+    """Yield data items across all pages, and fail if fewer arrived than the API promised."""
+    expected = None
+    received = 0
     for page in range(1, MAX_PAGES + 1):
         body = api(host, token, path, ctx, page=page)
         items = body.get("data") or []
+        pagination = (body.get("meta") or {}).get("pagination") or {}
+        if expected is None:
+            expected = pagination.get("total-count")
         yield from items
-        total_pages = (body.get("meta") or {}).get("pagination", {}).get("total-pages")
-        if not items or page >= (total_pages or page):
-            return
+        received += len(items)
+        if not items or page >= (pagination.get("total-pages") or page):
+            break
+    if isinstance(expected, int) and received < expected:
+        raise ListingTruncated(f"received {received} of {expected} records")
 
 
 def workspace_count(host, token, org, ctx):
-    body = api(host, token, f"/organizations/{urllib.parse.quote(org, safe='')}/workspaces", ctx, page=1)
+    org_path = urllib.parse.quote(org, safe="")
+    body = api(host, token, f"/organizations/{org_path}/workspaces", ctx, page=1, size=1)
     count = ((body.get("meta") or {}).get("pagination") or {}).get("total-count")
-    if count is None:
+    if not isinstance(count, int):
         raise ValueError("response has no meta.pagination.total-count")
     return count
+
+
+def read_token(path):
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8") as fh:
+            token = fh.read().strip()
+    except OSError as exc:
+        fail(f"cannot read token file: {exc}")
+    if not token:
+        fail(f"token file is empty: {path}")
+    return token
+
+
+def safe_cell(value):
+    """Neutralise CSV formula injection for names that begin with = + - @."""
+    text = "" if value is None else str(value)
+    return f"'{text}" if text[:1] in ("=", "+", "-", "@") else text
 
 
 def main():
@@ -98,52 +148,52 @@ def main():
     args = p.parse_args()
 
     host = normalise_host(args.host)
-    token = os.environ.get("TFE_TOKEN", "")
-    if args.token_file:
-        try:
-            with open(args.token_file) as fh:
-                token = fh.read().strip()
-        except OSError as exc:
-            sys.exit(f"error: cannot read token file: {exc}")
+    token = read_token(args.token_file) if args.token_file else os.environ.get("TFE_TOKEN", "").strip()
     if not host or not token:
-        sys.exit("error: set TFE_HOST and TFE_TOKEN (or --token-file)")
+        fail("set TFE_HOST and TFE_TOKEN (or --token-file)")
 
     ctx = ssl._create_unverified_context() if args.insecure else None
 
     if args.orgs:
         orgs = sorted({o.strip() for o in args.orgs.split(",") if o.strip()})
+        if not orgs:
+            fail("--orgs contained no organisation names")
     else:
         try:
             orgs = sorted({o["attributes"]["name"] for o in paged(host, token, "/admin/organizations", ctx)})
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403, 404):
-                sys.exit(
-                    f"error: cannot list organisations with this token (HTTP {exc.code}). "
+                fail(
+                    f"cannot list organisations with this token (HTTP {exc.code}). "
                     "Use a site-admin token, or pass --orgs with the organisations you need."
                 )
             raise
+        except ListingTruncated as exc:
+            fail(f"organisation list was truncated ({exc}); refusing to report a total.")
+        except (urllib.error.URLError, ValueError) as exc:
+            fail(f"cannot list organisations: {exc}")
 
     captured = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
     rows = []
     for org in orgs:
         try:
-            rows.append((org, workspace_count(host, token, org, ctx)))
+            rows.append(Row(org, workspace_count(host, token, org, ctx)))
         except (urllib.error.HTTPError, urllib.error.URLError, ValueError) as exc:
             reason = f"HTTP {exc.code}" if isinstance(exc, urllib.error.HTTPError) else str(exc)
-            rows.append((org, None, reason))
+            rows.append(Row(org, None, reason))
 
-    failed = [r for r in rows if r[1] is None]
-    total = sum(r[1] for r in rows if r[1] is not None)
-    width = max([len(r[0]) for r in rows] + [12])
+    failed = [r for r in rows if r.count is None]
+    total = sum(r.count for r in rows if r.count is not None)
+    width = max([len(r.org) for r in rows] + [12])
 
     print(f"TFE workspace count - {host} - {captured}")
     print(f"{'organisation':<{width}}  workspaces")
     print(f"{'-' * width}  ----------")
     for row in rows:
-        if row[1] is None:
-            print(f"{row[0]:<{width}}  error ({row[2]})")
+        if row.count is None:
+            print(f"{row.org:<{width}}  error ({row.reason})")
         else:
-            print(f"{row[0]:<{width}}  {row[1]}")
+            print(f"{row.org:<{width}}  {row.count}")
     print(f"{'-' * width}  ----------")
     if failed:
         print(f"{'TOTAL':<{width}}  {total} (INCOMPLETE - {len(failed)} organisation(s) failed)")
@@ -156,8 +206,8 @@ def main():
             w = csv.writer(fh)
             w.writerow(["captured_utc", "host", "organisation", "workspaces"])
             for row in rows:
-                w.writerow([captured, host, row[0], row[1] if row[1] is not None else ""])
-            w.writerow([captured, host, "TOTAL", "INCOMPLETE" if failed else total])
+                w.writerow([captured, safe_cell(host), safe_cell(row.org), row.count if row.count is not None else ""])
+            w.writerow([captured, safe_cell(host), "TOTAL", "INCOMPLETE" if failed else total])
         print(f"\nCSV written to {args.csv}")
 
     if failed:

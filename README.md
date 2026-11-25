@@ -88,6 +88,16 @@ limited (`429`) and `5xx` responses are retried up to three times, honouring `Re
   CSV contains the capture timestamp, hostname, organisation names and counts only.
 - The count is point-in-time: workspaces that exist at the moment of capture.
 
+## Self-checks
+
+Nine stdlib-only tests cover the cases that would otherwise produce a wrong licence number:
+incomplete runs, a missing `total-count`, duplicate `--orgs`, a truncated organisation list and
+a null pagination block.
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
 ## Using tfctl instead
 
 If the [`tfctl`](https://github.com/hashicorp/tfctl-cli) CLI is available or already approved,
